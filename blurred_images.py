@@ -45,6 +45,9 @@ def main(args):
             for file_name in os.listdir(os.path.join(args.src_dir, dir_1, dir_2)):
                 img = cv2.imread(os.path.join(args.src_dir, dir_1, dir_2, file_name),
                                  cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    print(f"Warning: Failed to load image {img}. Skipping this file.")
+                    continue                 
                 if args.method == "gaussian":
                     img_blured = cv2.GaussianBlur(img, (0, 0), args.sigma)
                 elif args.method == "mean":

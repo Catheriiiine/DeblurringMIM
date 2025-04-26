@@ -30,12 +30,26 @@ from model import models_dconvmae, models_convmae, models_mae, models_dmae
 from engine_pretrain import train_one_epoch, evaluate_pretrain, \
     train_one_epoch_corrupt, evaluate_pretrain_corrupt
 from util.dataset_us import CorruptDataset
+def add_weight_decay(model, weight_decay=1e-5, skip_list=()):
+    decay = []
+    no_decay = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue  # frozen weights
+        if any(nd in name for nd in skip_list):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    return [
+        {'params': decay, 'weight_decay': weight_decay},
+        {'params': no_decay, 'weight_decay': 0.}
+    ]
 
 def get_args_parser():
     parser = argparse.ArgumentParser('ConvMAE pre-training', add_help=False)
     parser.add_argument('--batch_size', default=256, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=12000, type=int)
+    parser.add_argument('--epochs', default=1229, type=int) #fix: 12000
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
@@ -226,6 +240,8 @@ def main(args):
     
     # following timm: set wd as 0 for bias and norm layers
     param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
+    # param_groups = add_weight_decay(model_without_ddp, args.weight_decay)
+
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()

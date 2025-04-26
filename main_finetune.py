@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
-
+from torch.utils.data import TensorDataset, DataLoader
 import timm
 
 #assert timm.__version__ == "0.3.2" # version check
@@ -29,17 +29,22 @@ import util.misc as misc
 from util.datasets import build_dataset, build_dataset_test
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
-from model import models_vit, models_convvit
+from model import models_vit, models_convvit, models_effi
 
 from engine_finetune import train_one_epoch, evaluate, evaluate_test
+from engine_finetune import evaluate_bootstrap
+
 
 import copy
-    
+#fix
+# import pdb; pdb.set_trace()
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('ConvMAE fine-tuning for image classification', add_help=False)
     parser.add_argument('--batch_size', default=128, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=10000000, type=int)
+    parser.add_argument('--epochs', default=100, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
@@ -155,6 +160,7 @@ def get_args_parser():
 
 
 def main(args):
+
     misc.init_distributed_mode(args)
 
     # print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
@@ -173,6 +179,32 @@ def main(args):
     dataset_val = build_dataset(is_train=False, args=args)
     dataset_test = build_dataset_test(is_train=False, args=args)
 
+    # #fix: dummy dataset
+    # # Define parameters for dummy data
+    # batch_size = 4  # Set the batch size
+    # num_classes = 2  # Adjust based on your model's output classes
+    # image_size = (3, 224, 224)  # Typical image size for CNN models
+
+    # # Generate random dummy images and labels
+    # dummy_train_images = torch.randint(0, 256, (batch_size, *image_size), dtype=torch.uint8)
+    # dummy_train_labels = torch.randint(0, num_classes, (batch_size,), dtype=torch.long)
+
+    # dummy_val_images = torch.randint(0, 256, (batch_size, *image_size), dtype=torch.uint8)
+    # dummy_val_labels = torch.randint(0, num_classes, (batch_size,), dtype=torch.long)
+
+    # dummy_test_images = torch.randint(0, 256, (batch_size, *image_size), dtype=torch.uint8)
+    # dummy_test_labels = torch.randint(0, num_classes, (batch_size,), dtype=torch.long)
+    # dummy_train_images = dummy_train_images.float().div(255).half().to(device)
+    # dummy_val_images = dummy_val_images.float().div(255).half().to(device)
+    # dummy_test_images = dummy_test_images.float().div(255).half().to(device)
+
+
+
+    # # Convert to TensorDataset
+    # dataset_train = TensorDataset(dummy_train_images, dummy_train_labels)
+    # dataset_val = TensorDataset(dummy_val_images, dummy_val_labels)
+    # dataset_test = TensorDataset(dummy_test_images, dummy_test_labels)
+
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
         global_rank = misc.get_rank()
@@ -189,7 +221,7 @@ def main(args):
                 dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=True)  # shuffle=True to reduce monitor bias
             sampler_test = torch.utils.data.DistributedSampler(
                 dataset_test, num_replicas=num_tasks, rank=global_rank, shuffle=True)  # shuffle=True to reduce monitor bias
-         
+        
         else:
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
             sampler_test = torch.utils.data.SequentialSampler(dataset_test)
@@ -239,6 +271,7 @@ def main(args):
     # Convvit
     if "convvit_base_patch16" == args.model or "convvit_large_patch16" == args.model or "convvit_huge_patch16" == args.model:
         model = models_convvit.__dict__[args.model](
+            drop_rate=0.0,
             num_classes=args.nb_classes,
             drop_path_rate=args.drop_path,
             global_pool=args.global_pool,
@@ -250,6 +283,9 @@ def main(args):
             drop_path_rate=args.drop_path,
             global_pool=args.global_pool,
         )
+    
+    elif "efficientnet_from_knees"  == args.model:
+        model = models_effi.__dict__[args.model](out_features=1)
     else:
         model = timm.create_model(args.model,
                                pretrained=True,
@@ -275,12 +311,19 @@ def main(args):
         print(msg)
 
         if args.global_pool:
+            # fix:
             assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
+            # assert set(msg.missing_keys) == {'classifier.1.weight', 'classifier.1.bias'}
+            pass
+
         else:
             assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
 
         # manually initialize fc layer
+        # fix
         trunc_normal_(model.head.weight, std=2e-5)
+        # trunc_normal_(model.model.classifier[1].weight, std=2e-5)
+
 
     model.to(device)
 
@@ -316,10 +359,15 @@ def main(args):
     if mixup_fn is not None:
         # smoothing is handled with mixup label transform
         criterion = SoftTargetCrossEntropy()
+        print("1")
     elif args.smoothing > 0.:
+        
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+        print(f"Label Smoothing Value: {args.smoothing}")
+        print("2")
     else:
         criterion = torch.nn.CrossEntropyLoss()
+        print("3")
 
     #print("criterion = %s" % str(criterion))
 
@@ -327,6 +375,10 @@ def main(args):
     model_best = copy.deepcopy(model)
 
     if args.eval:
+        correct_paths_pos = []    # Correctly classified and label==positive (1)
+        correct_paths_neg = []    # Correctly classified and label==negative (0)
+        incorrect_paths_pos = []  # Incorrectly classified and label==positive (1)
+        incorrect_paths_neg = []
         test_stats = evaluate(data_loader_test, model_best, device)
         print(f"Accuracy of the network on the {len(dataset_test)} test images: {test_stats['acc1']:.1f}%")
         acc, f1, precision, recall, cls_report, auroc = evaluate_test(dataset_test, model_best, device)
@@ -343,8 +395,68 @@ def main(args):
             f.writelines("auroc:" + str(auroc*100) + "\n")
             f.writelines(cls_report + "\n")
             f.writelines("---"*10) 
+        mean_diff, bootstrap_differences = evaluate_bootstrap(dataset_test, model_best, device, n_bootstrap=5000)
+        print(f"Bootstrap mean difference (over 5000 iterations): {mean_diff*100:.2f}%")
+        
+        all_paths = [path for path, _ in dataset_test.samples]
+        global_index = 0
+        model_best.eval()
+        with torch.no_grad():
+            for images, labels in data_loader_test:
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                
+                outputs = model_best(images)
+                preds = outputs.argmax(dim=1)
+                
+                batch_size = images.size(0)
+                for i in range(batch_size):
+                    # Retrieve file path by matching the global sample index.
+                    path = all_paths[global_index]
+                    true_label = labels[i].item()    # 0 for negative, 1 for positive
+                    pred_label = preds[i].item()
+                    
+                    if pred_label == true_label:  # Correct classification
+                        if true_label == 1 and len(correct_paths_pos) < 5:
+                            correct_paths_pos.append(path)
+                        elif true_label == 0 and len(correct_paths_neg) < 5:
+                            correct_paths_neg.append(path)
+                    else:  # Incorrect classification
+                        if true_label == 1 and len(incorrect_paths_pos) < 5:
+                            incorrect_paths_pos.append(path)
+                        elif true_label == 0 and len(incorrect_paths_neg) < 5:
+                            incorrect_paths_neg.append(path)
+                    
+                    global_index += 1
+
+                    # Check if we have collected 5 for each category.
+                    if (len(correct_paths_pos) >= 5 and len(correct_paths_neg) >= 5 and
+                        len(incorrect_paths_pos) >= 5 and len(incorrect_paths_neg) >= 5):
+                        break
+                # If all lists have at least 5 items, break out of the outer loop.
+                if (len(correct_paths_pos) >= 5 and len(correct_paths_neg) >= 5 and
+                    len(incorrect_paths_pos) >= 5 and len(incorrect_paths_neg) >= 5):
+                    break
+        
+        # Print collected paths:
+        print("\nPaths to 5 correctly classified positive images:")
+        for p in correct_paths_pos[:5]:
+            print(p)
+
+        print("\nPaths to 5 correctly classified negative images:")
+        for p in correct_paths_neg[:5]:
+            print(p)
+
+        print("\nPaths to 5 incorrectly classified positive images:")
+        for p in incorrect_paths_pos[:5]:
+            print(p)
+
+        print("\nPaths to 5 incorrectly classified negative images:")
+        for p in incorrect_paths_neg[:5]:
+            print(p)
             
         exit(0)
+
         
         
     print(f"Start training for {args.epochs} epochs")
@@ -385,9 +497,9 @@ def main(args):
         
         if args.output_dir:
             if test_stats["acc1"] > max_accuracy:
-                if max_epoch != -1:
-                    old_path = args.output_dir + "/checkpoint-" + str(max_epoch) + ".pth"
-                    os.remove(old_path)
+                # if max_epoch != -1:
+                #     old_path = args.output_dir + "/checkpoint-" + str(max_epoch) + ".pth"
+                #     os.remove(old_path)
                 max_epoch = epoch
                 model_best = copy.deepcopy(model)
                 misc.save_model(
@@ -417,9 +529,15 @@ def main(args):
     print('Training time {}'.format(total_time_str))
 
 
+
+
 if __name__ == '__main__':
+    # print(torch.version.cuda)     # e.g. '11.7' or '12.1'
+    # print(torch.version.__version__)  # shows PyTorch version
+    # print(torch.cuda.is_available())
     args = get_args_parser()
     args = args.parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
+
